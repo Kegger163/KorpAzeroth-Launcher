@@ -239,13 +239,23 @@ class KorpAzerothLauncher(QMainWindow):
         self.install_status.setWordWrap(True)
         layout.addWidget(self.install_status)
 
+        
         info = QLabel(
-            "NEW PLAYER?\n\n"
-            "Guided installation of compatible WoW 3.3.5a "
-            "client files is planned for a future version.\n\n"
-            "Players must obtain their game files through "
-            "legitimate means."
+            "NEW PLAYER? GET STARTED\n\n"
+            "1. Obtain a compatible World of Warcraft "
+            "3.3.5a (build 12340) client.\n\n"
+            "2. Extract or install the game into a folder "
+            "on your computer.\n\n"
+            "3. Click BROWSE FOR GAME above and select "
+            "the folder containing Wow.exe.\n\n"
+            "4. The launcher will verify your game version "
+            "and required data files.\n\n"
+            "5. Once verified, open the PLAY tab and "
+            "click PLAY. The launcher will automatically "
+            "configure the KorpAzeroth realmlist.\n\n"
+            "6. Log in using your KorpAzeroth game account."
         )
+
         info.setWordWrap(True)
         info.setObjectName("announcement")
         layout.addWidget(info)
