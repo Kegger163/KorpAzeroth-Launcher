@@ -3,6 +3,11 @@ import sys
 import socket
 import shutil
 import subprocess
+import zipfile
+import hashlib
+import os
+import stat
+import urllib.request
 from pathlib import Path
 from datetime import datetime
 
@@ -10,19 +15,172 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout,
     QHBoxLayout, QLabel, QPushButton, QLineEdit,
     QFileDialog, QMessageBox, QFrame, QTabWidget,
-    QGridLayout, QComboBox
+    QGridLayout, QComboBox, QProgressBar
 )
-from PySide6.QtCore import Qt, QTimer, QSettings
+from PySide6.QtCore import Qt, QTimer, QSettings, QThread, Signal
 
 
 # KORPAZEROTH CONFIGURATION
 REALM_HOST = "korpazeroth.duckdns.org"
 AUTH_PORT = 3724
 EXPECTED_VERSION = "3.3.5.12340"
+CLIENT_DOWNLOAD_URL = (
+    "https://korpazeroth-downloads.duckdns.org/"
+    "clients/KorpAzeroth-WoW-3.3.5a.zip"
+)
+CLIENT_SHA256 = "644a8e6b49aef8f32c7ae529614ab6c07c266c2af1ad5355140da55556ff8262"
+CLIENT_ARCHIVE_NAME = "KorpAzeroth-WoW-3.3.5a.zip"
 
 DEFAULT_GAME_PATH = str(
     Path.home() / "WoW/WoW_3.3.5a/WoW_3.3.5a"
 )
+
+def verify_archive(path, status=None, progress=None):
+    """Verify the archive against the checksum of the server copy."""
+    digest = hashlib.sha256()
+    size = path.stat().st_size
+    processed = 0
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(4 * 1024 * 1024), b""):
+            digest.update(chunk)
+            processed += len(chunk)
+            if progress and size:
+                progress(int(processed * 100 / size))
+    if digest.hexdigest().lower() != CLIENT_SHA256:
+        raise ValueError("Archive checksum mismatch. The download may be incomplete or damaged.")
+    return True
+
+
+class ClientDownloadWorker(QThread):
+    progress = Signal(int)
+    status = Signal(str)
+    completed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, url, destination):
+        super().__init__()
+        self.url = url
+        self.destination = Path(destination)
+
+    def run(self):
+        partial = self.destination.with_name(self.destination.name + ".part")
+        try:
+            self.destination.parent.mkdir(parents=True, exist_ok=True)
+            if self.destination.is_file():
+                self.status.emit("Checking existing archive...")
+                try:
+                    verify_archive(self.destination, progress=self.progress.emit)
+                except (ValueError, OSError):
+                    self.status.emit("Existing archive is invalid; downloading a fresh copy...")
+                else:
+                    self.completed.emit(str(self.destination))
+                    return
+
+            self.status.emit("Connecting to download server...")
+            # Restart interrupted downloads safely; never mistake .part for a valid ZIP.
+            request = urllib.request.Request(
+                self.url, headers={"User-Agent": "KorpAzeroth-Launcher"}
+            )
+            with urllib.request.urlopen(request, timeout=60) as response:
+                if response.status != 200:
+                    raise IOError(f"Unexpected HTTP status: {response.status}")
+                total = int(response.headers.get("Content-Length", "0"))
+                downloaded = 0
+                with partial.open("wb") as output:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        downloaded += len(chunk)
+                        if total:
+                            self.progress.emit(min(100, int(downloaded * 100 / total)))
+            if total and downloaded != total:
+                raise IOError("Download ended before all bytes were received.")
+            self.status.emit("Verifying SHA-256 checksum...")
+            self.progress.emit(0)
+            verify_archive(partial, progress=self.progress.emit)
+            os.replace(partial, self.destination)
+            self.completed.emit(str(self.destination))
+        except Exception as error:
+            self.failed.emit(str(error))
+
+
+class ClientExtractionWorker(QThread):
+    progress = Signal(int)
+    status = Signal(str)
+    completed = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, archive_path, install_dir):
+        super().__init__()
+        self.archive_path = Path(archive_path)
+        self.install_dir = Path(install_dir)
+
+    def run(self):
+        import tempfile
+        try:
+            if self.install_dir.exists():
+                raise FileExistsError(
+                    f"Installation destination already exists: {self.install_dir}"
+                )
+            self.install_dir.parent.mkdir(parents=True, exist_ok=True)
+            self.status.emit("Checking ZIP contents...")
+            with zipfile.ZipFile(self.archive_path) as archive:
+                files = archive.infolist()
+                if not files:
+                    raise ValueError("Game archive is empty.")
+                # Restrict paths and reject symbolic links and special files.
+                staging_root = Path("WoW_3.3.5a")
+                for entry in files:
+                    name = entry.filename.replace("\\", "/")
+                    parts = name.split("/")
+                    if (name.startswith("/") or
+                            any(part in ("..", "") for part in parts[:-1]) or
+                            (parts and ":" in parts[0]) or
+                            any(part == ".." for part in parts) or
+                            (entry.create_system == 3 and
+                             stat.S_ISLNK(entry.external_attr >> 16))):
+                        raise ValueError(f"Unsafe archive entry: {entry.filename}")
+                    if not name.startswith("WoW_3.3.5a/"):
+                        raise ValueError("Unexpected folder layout in game archive.")
+                self.status.emit("Extracting game files...")
+                with tempfile.TemporaryDirectory(
+                    prefix=".korpazeroth-install-", dir=self.install_dir.parent
+                ) as temporary:
+                    staging = Path(temporary)
+                    root = staging.resolve()
+                    total_bytes = sum(e.file_size for e in files if not e.is_dir())
+                    processed = 0
+                    for entry in files:
+                        target = (staging / entry.filename).resolve()
+                        if not target.is_relative_to(root):
+                            raise ValueError("Unsafe extraction path.")
+                        if entry.is_dir():
+                            target.mkdir(parents=True, exist_ok=True)
+                            continue
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with archive.open(entry) as source, target.open("wb") as output:
+                            while True:
+                                chunk = source.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                output.write(chunk)
+                                processed += len(chunk)
+                                if total_bytes:
+                                    self.progress.emit(min(100, int(processed * 100 / total_bytes)))
+                    extracted = staging / "WoW_3.3.5a"
+                    if not (extracted / "Wow.exe").is_file():
+                        raise ValueError("Wow.exe not found in extracted client.")
+                    for name in ("common.MPQ", "expansion.MPQ", "lichking.MPQ"):
+                        if not (extracted / "Data" / name).is_file():
+                            raise ValueError(f"Required game file missing: {name}")
+                    if self.install_dir.exists():
+                        raise FileExistsError("Installation folder already exists.")
+                    extracted.rename(self.install_dir)
+            self.completed.emit(str(self.install_dir))
+        except Exception as error:
+            self.failed.emit(str(error))
 
 
 class KorpAzerothLauncher(QMainWindow):
@@ -232,6 +390,26 @@ class KorpAzerothLauncher(QMainWindow):
         browse = QPushButton("BROWSE FOR GAME")
         browse.clicked.connect(self.browse_game)
         layout.addWidget(browse)
+        self.download_button = QPushButton(
+            "DOWNLOAD & INSTALL WOW 3.3.5a"
+        )
+        self.download_button.setEnabled(True)
+        self.download_button.setToolTip(
+            "Download, verify, and install the WoW 3.3.5a client."
+        )
+        self.download_button.clicked.connect(
+            self.start_client_download
+        )
+        layout.addWidget(self.download_button)
+        self.download_progress = QProgressBar()
+        self.download_progress.setRange(0, 100)
+        self.download_progress.setValue(0)
+        self.download_progress.setVisible(False)
+        layout.addWidget(self.download_progress)
+
+        self.download_status = QLabel("")
+        self.download_status.setWordWrap(True)
+        layout.addWidget(self.download_status)    
 
         self.install_status = QLabel(
             "No installation selected."
@@ -263,9 +441,58 @@ class KorpAzerothLauncher(QMainWindow):
         layout.addStretch()
 
         self.tabs.addTab(page, "INSTALLATION")
+    def start_client_download(self):
+        install_dir = Path.home() / "Games" / "KorpAzeroth"
+        if install_dir.exists():
+            QMessageBox.warning(
+                self, "Installation Exists",
+                f"The destination already exists:\n{install_dir}\n\n"
+                "Select an existing game using Browse, or move the folder first."
+            )
+            return
+        destination = Path.home() / "Downloads" / CLIENT_ARCHIVE_NAME
+        self.download_button.setEnabled(False)
+        self.download_progress.setValue(0)
+        self.download_progress.setVisible(True)
+        self.download_status.setText("Starting download...")
+        self.download_worker = ClientDownloadWorker(CLIENT_DOWNLOAD_URL, destination)
+        self.download_worker.progress.connect(self.download_progress.setValue)
+        self.download_worker.status.connect(self.download_status.setText)
+        self.download_worker.completed.connect(self.client_download_completed)
+        self.download_worker.failed.connect(self.client_download_failed)
+        self.download_worker.start()
+
+    def client_download_completed(self, archive_path):
+        self.download_progress.setValue(0)
+        self.download_status.setText("Archive verified. Preparing installation...")
+        install_dir = Path.home() / "Games" / "KorpAzeroth"
+        self.extraction_worker = ClientExtractionWorker(archive_path, install_dir)
+        self.extraction_worker.progress.connect(self.download_progress.setValue)
+        self.extraction_worker.status.connect(self.download_status.setText)
+        self.extraction_worker.completed.connect(self.client_installation_completed)
+        self.extraction_worker.failed.connect(self.client_download_failed)
+        self.extraction_worker.start()
+
+    def client_installation_completed(self, install_path):
+        self.download_progress.setValue(100)
+        self.download_status.setText("Installation complete!")
+        self.path_input.setText(install_path)
+        self.check_game()
+        self.download_button.setEnabled(True)
+        QMessageBox.information(
+            self, "Installation Complete",
+            f"World of Warcraft 3.3.5a installed to:\n{install_path}\n\n"
+            "The launcher has selected this installation."
+        )
+
+    def client_download_failed(self, error):
+        self.download_status.setText(f"Download or installation failed: {error}")
+        self.download_button.setEnabled(True)
+        QMessageBox.warning(
+            self, "Installation Failed", f"Could not install the WoW client:\n\n{error}"
+        )
 
     def create_settings_tab(self):
-
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(20, 25, 20, 20)
@@ -328,7 +555,7 @@ class KorpAzerothLauncher(QMainWindow):
 
         about = QLabel(
             "KorpAzeroth Launcher\n\n"
-            "Version 0.3 Development\n\n"
+            "Version 0.5 Development\n\n"
             "A custom launcher for the KorpAzeroth "
             "Wrath of the Lich King realm.\n\n"
             "Client: World of Warcraft 3.3.5a\n"
