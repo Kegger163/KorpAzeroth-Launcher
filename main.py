@@ -106,6 +106,36 @@ class ClientDownloadWorker(QThread):
             self.failed.emit(str(error))
 
 
+def verify_extracted_client(archive_path, install_dir):
+    """Check every extracted file against its ZIP entry."""
+    import zlib
+
+    install_dir = Path(install_dir)
+
+    with zipfile.ZipFile(archive_path) as archive:
+        entries = [e for e in archive.infolist() if not e.is_dir()]
+
+        for entry in entries:
+            relative = Path(*Path(entry.filename).parts[1:])
+            target = install_dir / relative
+
+            if not target.is_file():
+                raise ValueError(f"Missing extracted file: {relative}")
+
+            if target.stat().st_size != entry.file_size:
+                raise ValueError(f"Incorrect file size: {relative}")
+
+            crc = 0
+            with target.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    crc = zlib.crc32(chunk, crc)
+
+            if crc != entry.CRC:
+                raise ValueError(f"Corrupted extracted file: {relative}")
+
+    return True
+
+
 class ClientExtractionWorker(QThread):
     progress = Signal(int)
     status = Signal(str)
@@ -187,6 +217,9 @@ class ClientExtractionWorker(QThread):
                         file = locale_dir / name
                         if not file.is_file() or file.stat().st_size == 0:
                             raise ValueError(f"Required language file missing: Data/enUS/{name}")
+                    self.status.emit("Verifying all extracted game files...")
+                    verify_extracted_client(self.archive_path, extracted)
+
                     if self.install_dir.exists():
                         raise FileExistsError("Installation folder already exists.")
                     extracted.rename(self.install_dir)
