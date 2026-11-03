@@ -175,6 +175,18 @@ class ClientExtractionWorker(QThread):
                     for name in ("common.MPQ", "expansion.MPQ", "lichking.MPQ"):
                         if not (extracted / "Data" / name).is_file():
                             raise ValueError(f"Required game file missing: {name}")
+
+                    locale_dir = extracted / "Data" / "enUS"
+
+                    for name in (
+                        "locale-enUS.MPQ",
+                        "base-enUS.MPQ",
+                        "expansion-locale-enUS.MPQ",
+                        "lichking-locale-enUS.MPQ",
+                    ):
+                        file = locale_dir / name
+                        if not file.is_file() or file.stat().st_size == 0:
+                            raise ValueError(f"Required language file missing: Data/enUS/{name}")
                     if self.install_dir.exists():
                         raise FileExistsError("Installation folder already exists.")
                     extracted.rename(self.install_dir)
@@ -806,6 +818,18 @@ class KorpAzerothLauncher(QMainWindow):
 
         if missing:
             return False, "Missing game data: " + ", ".join(missing)
+
+        locale_dir = data / "enUS"
+        required_locale = (
+            "locale-enUS.MPQ",
+            "base-enUS.MPQ",
+            "expansion-locale-enUS.MPQ",
+            "lichking-locale-enUS.MPQ",
+        )
+        for name in required_locale:
+            file = locale_dir / name
+            if not file.is_file() or file.stat().st_size == 0:
+                return False, f"Missing language file: Data/enUS/{name}"
 
         version = self.get_version(executable)
 
