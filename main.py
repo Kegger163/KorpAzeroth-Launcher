@@ -796,7 +796,11 @@ class KorpAzerothLauncher(QMainWindow):
             if result.returncode != 0:
                 return None
 
-            return result.stdout.strip()
+            version = result.stdout.strip()
+            parts = [part.strip() for part in version.replace(",", ".").split(".")]
+            if len(parts) == 4 and all(part.isdigit() for part in parts):
+                return ".".join(parts)
+            return version
 
         except (OSError, subprocess.TimeoutExpired):
             return None
