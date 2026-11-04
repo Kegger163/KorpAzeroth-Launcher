@@ -106,7 +106,7 @@ class ClientDownloadWorker(QThread):
             self.failed.emit(str(error))
 
 
-def verify_extracted_client(archive_path, install_dir):
+def verify_extracted_client(archive_path, install_dir, progress_callback=None):
     """Check every extracted file against its ZIP entry."""
     import zlib
 
@@ -115,7 +115,9 @@ def verify_extracted_client(archive_path, install_dir):
     with zipfile.ZipFile(archive_path) as archive:
         entries = [e for e in archive.infolist() if not e.is_dir()]
 
-        for entry in entries:
+        for index, entry in enumerate(entries, 1):
+            if progress_callback:
+                progress_callback(index - 1, len(entries))
             relative = Path(*Path(entry.filename).parts[1:])
             target = install_dir / relative
 
@@ -132,6 +134,9 @@ def verify_extracted_client(archive_path, install_dir):
 
             if crc != entry.CRC:
                 raise ValueError(f"Corrupted extracted file: {relative}")
+
+    if progress_callback:
+        progress_callback(len(entries), len(entries))
 
     return True
 
@@ -218,7 +223,18 @@ class ClientExtractionWorker(QThread):
                         if not file.is_file() or file.stat().st_size == 0:
                             raise ValueError(f"Required language file missing: Data/enUS/{name}")
                     self.status.emit("Verifying all extracted game files...")
-                    verify_extracted_client(self.archive_path, extracted)
+                    def report_verification(done, total):
+                        if total:
+                            percent = int(done * 100 / total)
+                            self.progress.emit(percent)
+                            self.status.emit(
+                                f"Verifying game files: {done:,} / {total:,}"
+                            )
+
+                    self.progress.emit(0)
+                    verify_extracted_client(
+                        self.archive_path, extracted, report_verification
+                    )
 
                     if self.install_dir.exists():
                         raise FileExistsError("Installation folder already exists.")
